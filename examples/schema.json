@@ -1,0 +1,70 @@
+{
+  "routes": [
+    {
+      "path": "/api/users",
+      "method": "GET",
+      "response": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": { "type": "integer" },
+            "user_email": { "type": "string" },
+            "full_name": { "type": "string" },
+            "price_jpy": { "type": "integer" },
+            "created_at": { "type": "string", "format": "date-time" }
+          },
+          "required": ["id", "user_email", "full_name"]
+        }
+      }
+    },
+    {
+      "path": "/api/users",
+      "method": "POST",
+      "status": 201,
+      "response": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer" },
+          "user_email": { "type": "string" },
+          "full_name": { "type": "string" },
+          "price_jpy": { "type": "integer" },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      }
+    },
+    {
+      "path": "/api/users/{id}",
+      "method": "GET",
+      "response": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer" },
+          "user_email": { "type": "string" },
+          "full_name": { "type": "string" },
+          "price_jpy": { "type": "integer" },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      }
+    },
+    {
+      "path": "/api/users/{id}",
+      "method": "PUT",
+      "response": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer" },
+          "user_email": { "type": "string" },
+          "full_name": { "type": "string" },
+          "price_jpy": { "type": "integer" },
+          "created_at": { "type": "string", "format": "date-time" }
+        }
+      }
+    },
+    {
+      "path": "/api/users/{id}",
+      "method": "DELETE",
+      "status": 204
+    }
+  ]
+}
