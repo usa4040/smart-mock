@@ -1,3 +1,4 @@
+pub mod check;
 pub mod context;
 
 use crate::schema::types::SchemaNode;
@@ -64,6 +65,65 @@ pub fn generate_items(schema: &SchemaNode, count: usize) -> Vec<Value> {
     (0..count).map(|_| generate_item(schema)).collect()
 }
 
+/// Fill contract properties the body left out. Client values stay.
+pub fn fill_missing(schema: &SchemaNode, value: &mut Value) {
+    let SchemaNode::Object { properties, .. } = schema else {
+        return;
+    };
+    let Value::Object(map) = value else {
+        return;
+    };
+    for (key, node) in properties {
+        if key == "id" || map.contains_key(key) {
+            continue;
+        }
+        map.insert(key.clone(), generate_with_name(node, key));
+    }
+}
+
+/// Keep a client id. Otherwise mint one that does not collide with `existing`.
+pub fn assign_missing_id(value: &mut Value, kind: crate::schema::types::IdKind, existing: &[Value]) {
+    let Value::Object(map) = value else {
+        return;
+    };
+    if map.get("id").is_some_and(|id| !id.is_null()) {
+        return;
+    }
+    let id = match kind {
+        crate::schema::types::IdKind::Integer => json!(next_integer_id(existing)),
+        crate::schema::types::IdKind::String => json!(uuid::Uuid::new_v4().to_string()),
+    };
+    map.insert("id".into(), id);
+}
+
+pub fn force_path_id(value: &mut Value, id: &str, kind: crate::schema::types::IdKind) {
+    let Value::Object(map) = value else {
+        return;
+    };
+    let stored = match kind {
+        crate::schema::types::IdKind::Integer => match id.parse::<i64>() {
+            Ok(n) => json!(n),
+            Err(_) => json!(id),
+        },
+        crate::schema::types::IdKind::String => json!(id),
+    };
+    map.insert("id".into(), stored);
+}
+
+pub fn next_integer_id(existing: &[Value]) -> i64 {
+    existing
+        .iter()
+        .filter_map(|value| value.get("id"))
+        .filter_map(|id| match id {
+            Value::Number(n) => n.as_i64(),
+            Value::String(s) => s.parse().ok(),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+        + 1
+}
+
 /// Ensure an object has an `id` field suitable for store lookups.
 pub fn ensure_id(mut value: Value, next_int_id: i64) -> Value {
     if let Value::Object(ref mut map) = value {
@@ -119,6 +179,7 @@ mod tests {
         let schema = SchemaNode::Object {
             properties: props,
             required: vec![],
+            additional_properties: true,
         };
         let value = generate(&schema);
         let email = value["user_email"].as_str().unwrap();

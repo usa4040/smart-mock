@@ -4,11 +4,11 @@ use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(
     name = "smart-mock",
-    about = "Context-aware local Mock API server from OpenAPI, TypeScript, or JSON schemas",
+    about = "Stateful OpenAPI mock server. POST sticks, and spec violations fail.",
     version
 )]
 pub struct Cli {
-    /// Path to OpenAPI (JSON/YAML), TypeScript interface, or JSON schema definition
+    /// Path to an OpenAPI v3 document (JSON or YAML)
     pub schema: PathBuf,
 
     /// Port to bind the mock server

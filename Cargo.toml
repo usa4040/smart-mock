@@ -2,7 +2,7 @@
 name = "smart-mock"
 version = "0.1.0"
 edition = "2021"
-description = "Context-aware local Mock API server from OpenAPI, TypeScript, or JSON schemas"
+description = "Stateful OpenAPI mock server. Writes stick, and spec violations fail."
 license = "MIT"
 rust-version = "1.83"
 

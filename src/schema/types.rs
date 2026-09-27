@@ -1,5 +1,6 @@
 use axum::http::Method;
 use indexmap::IndexMap;
+use serde_json::Value;
 
 /// Internal representation of a JSON Schema-like node used for data generation.
 #[derive(Debug, Clone, PartialEq)]
@@ -7,6 +8,8 @@ pub enum SchemaNode {
     Object {
         properties: IndexMap<String, SchemaNode>,
         required: Vec<String>,
+        /// When false, properties outside `properties` are a spec violation.
+        additional_properties: bool,
     },
     Array {
         items: Box<SchemaNode>,
@@ -27,6 +30,7 @@ impl SchemaNode {
         SchemaNode::Object {
             properties: IndexMap::new(),
             required: Vec::new(),
+            additional_properties: true,
         }
     }
 
@@ -39,7 +43,49 @@ impl SchemaNode {
     }
 }
 
-/// A single HTTP route derived from the input schema.
+pub const RESET_PATH: &str = "/__smart_mock/reset";
+
+/// How a missing id is minted for a recorded collection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdKind {
+    Integer,
+    String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamIn {
+    Query,
+    Header,
+    Path,
+    Cookie,
+}
+
+#[derive(Debug, Clone)]
+pub struct RequestParam {
+    pub location: ParamIn,
+    pub name: String,
+    pub required: bool,
+    pub schema: SchemaNode,
+}
+
+/// One way to prove auth. A requirement is an OR of AND-groups of these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthScheme {
+    AuthorizationHeader,
+    ApiKeyHeader(String),
+    ApiKeyQuery(String),
+    ApiKeyCookie(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthRequirement {
+    /// No credential is required. Includes a security list that contains `{}`.
+    None,
+    /// Caller must satisfy one group, and every scheme inside that group.
+    Required(Vec<Vec<AuthScheme>>),
+}
+
+/// A single HTTP route derived from an OpenAPI document.
 #[derive(Debug, Clone)]
 pub struct RouteInfo {
     pub method: Method,
@@ -47,8 +93,16 @@ pub struct RouteInfo {
     pub path: String,
     /// Collection key used for the in-memory store, e.g. `/api/users`
     pub collection_key: String,
+    /// This route reads or writes a recorded JSON-array collection.
+    pub recorded: bool,
     pub response_schema: SchemaNode,
+    pub request_schema: Option<SchemaNode>,
     pub status: u16,
+    /// `application/json` example, if the operation declares one.
+    pub example: Option<Value>,
+    pub auth: AuthRequirement,
+    pub params: Vec<RequestParam>,
+    pub id_kind: IdKind,
 }
 
 /// Derive a collection key by stripping trailing path parameters.
