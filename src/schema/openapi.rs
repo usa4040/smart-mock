@@ -1,5 +1,8 @@
 use crate::error::{AppError, Result};
-use crate::schema::types::{collection_key_from_path, RouteInfo, SchemaNode};
+use crate::schema::types::{
+    collection_key_from_path, AuthRequirement, AuthScheme, IdKind, ParamIn, RequestParam, RouteInfo,
+    SchemaNode,
+};
 use axum::http::Method;
 use indexmap::IndexMap;
 use openapiv3::{
@@ -41,13 +44,252 @@ pub fn parse(content: &str) -> Result<Vec<RouteInfo>> {
                 method,
                 path: path.clone(),
                 collection_key: collection_key_from_path(path),
+                recorded: false,
                 response_schema: schema_node,
+                request_schema: extract_request_schema(operation, &api),
                 status,
+                example: extract_example(operation, &api),
+                auth: operation_auth(operation, &api),
+                params: operation_params(path_item, operation, &api),
+                id_kind: IdKind::String,
             });
         }
     }
 
+    mark_recorded_collections(&mut routes);
     Ok(routes)
+}
+
+fn additional_properties_allowed(value: &Option<openapiv3::AdditionalProperties>) -> bool {
+    !matches!(value, Some(openapiv3::AdditionalProperties::Any(false)))
+}
+
+fn extract_request_schema(operation: &openapiv3::Operation, api: &OpenAPI) -> Option<SchemaNode> {
+    let body_ref = operation.request_body.as_ref()?;
+    let body = match body_ref {
+        ReferenceOr::Item(body) => body,
+        ReferenceOr::Reference { reference } => {
+            let name = reference.strip_prefix("#/components/requestBodies/")?;
+            let components = api.components.as_ref()?;
+            match components.request_bodies.get(name)? {
+                ReferenceOr::Item(body) => body,
+                ReferenceOr::Reference { .. } => return None,
+            }
+        }
+    };
+    let media = body.content.get("application/json")?;
+    let schema_ref = media.schema.as_ref()?;
+    Some(resolve_schema(schema_ref, api, 0))
+}
+
+fn extract_example(operation: &openapiv3::Operation, api: &OpenAPI) -> Option<Value> {
+    let resp_ref = success_response(operation)?;
+    let response = resolve_response(resp_ref, api)?;
+    let media = response.content.get("application/json")?;
+    if let Some(example) = &media.example {
+        return Some(example.clone());
+    }
+    for example_ref in media.examples.values() {
+        let example = match example_ref {
+            ReferenceOr::Item(example) => example,
+            ReferenceOr::Reference { reference } => {
+                let Some(name) = reference.strip_prefix("#/components/examples/") else {
+                    continue;
+                };
+                let Some(components) = api.components.as_ref() else {
+                    continue;
+                };
+                let Some(resolved) = components.examples.get(name) else {
+                    continue;
+                };
+                match resolved {
+                    ReferenceOr::Item(example) => example,
+                    ReferenceOr::Reference { .. } => continue,
+                }
+            }
+        };
+        if let Some(value) = &example.value {
+            return Some(value.clone());
+        }
+    }
+    None
+}
+
+fn success_response(operation: &openapiv3::Operation) -> Option<&ReferenceOr<openapiv3::Response>> {
+    let responses = &operation.responses.responses;
+    let preferred = [
+        StatusCode::Code(200),
+        StatusCode::Code(201),
+        StatusCode::Code(204),
+    ];
+    for code in &preferred {
+        if responses.contains_key(code) {
+            return responses.get(code);
+        }
+    }
+    responses.iter().find_map(|(code, resp)| match code {
+        StatusCode::Code(c) if (200..300).contains(c) => Some(resp),
+        _ => None,
+    })
+}
+
+fn resolve_response<'a>(
+    resp_ref: &'a ReferenceOr<openapiv3::Response>,
+    api: &'a OpenAPI,
+) -> Option<&'a openapiv3::Response> {
+    match resp_ref {
+        ReferenceOr::Item(response) => Some(response),
+        ReferenceOr::Reference { reference } => {
+            let name = reference.strip_prefix("#/components/responses/")?;
+            match api.components.as_ref()?.responses.get(name)? {
+                ReferenceOr::Item(response) => Some(response),
+                ReferenceOr::Reference { .. } => None,
+            }
+        }
+    }
+}
+
+fn operation_auth(operation: &openapiv3::Operation, api: &OpenAPI) -> AuthRequirement {
+    let Some(requirements) = operation.security.as_ref().or(api.security.as_ref()) else {
+        return AuthRequirement::None;
+    };
+    if requirements.is_empty() || requirements.iter().any(|req| req.is_empty()) {
+        return AuthRequirement::None;
+    }
+    let groups = requirements
+        .iter()
+        .map(|req| {
+            req.keys()
+                .map(|name| scheme_to_auth(name, api))
+                .collect()
+        })
+        .collect();
+    AuthRequirement::Required(groups)
+}
+
+fn scheme_to_auth(name: &str, api: &OpenAPI) -> AuthScheme {
+    let Some(components) = api.components.as_ref() else {
+        return AuthScheme::AuthorizationHeader;
+    };
+    let Some(scheme_ref) = components.security_schemes.get(name) else {
+        return AuthScheme::AuthorizationHeader;
+    };
+    let scheme = match scheme_ref {
+        ReferenceOr::Item(scheme) => scheme,
+        ReferenceOr::Reference { .. } => return AuthScheme::AuthorizationHeader,
+    };
+    match scheme {
+        openapiv3::SecurityScheme::APIKey { location, name, .. } => match location {
+            openapiv3::APIKeyLocation::Query => AuthScheme::ApiKeyQuery(name.clone()),
+            openapiv3::APIKeyLocation::Header => AuthScheme::ApiKeyHeader(name.clone()),
+            openapiv3::APIKeyLocation::Cookie => AuthScheme::ApiKeyCookie(name.clone()),
+        },
+        _ => AuthScheme::AuthorizationHeader,
+    }
+}
+
+fn operation_params(
+    path_item: &openapiv3::PathItem,
+    operation: &openapiv3::Operation,
+    api: &OpenAPI,
+) -> Vec<RequestParam> {
+    let mut params: Vec<RequestParam> = Vec::new();
+    for parameter in path_item.parameters.iter().chain(operation.parameters.iter()) {
+        if let Some(param) = convert_parameter(parameter, api) {
+            params.retain(|existing| {
+                !(existing.name == param.name && existing.location == param.location)
+            });
+            params.push(param);
+        }
+    }
+    params
+}
+
+fn convert_parameter(
+    parameter: &ReferenceOr<openapiv3::Parameter>,
+    api: &OpenAPI,
+) -> Option<RequestParam> {
+    let parameter = match parameter {
+        ReferenceOr::Item(parameter) => parameter,
+        ReferenceOr::Reference { reference } => {
+            let name = reference.strip_prefix("#/components/parameters/")?;
+            match api.components.as_ref()?.parameters.get(name)? {
+                ReferenceOr::Item(parameter) => parameter,
+                ReferenceOr::Reference { .. } => return None,
+            }
+        }
+    };
+    let (location, data) = match parameter {
+        openapiv3::Parameter::Query { parameter_data, .. } => (ParamIn::Query, parameter_data),
+        openapiv3::Parameter::Header { parameter_data, .. } => (ParamIn::Header, parameter_data),
+        openapiv3::Parameter::Path { parameter_data, .. } => (ParamIn::Path, parameter_data),
+        openapiv3::Parameter::Cookie { parameter_data, .. } => (ParamIn::Cookie, parameter_data),
+    };
+    let schema = match &data.format {
+        openapiv3::ParameterSchemaOrContent::Schema(schema) => resolve_schema(schema, api, 0),
+        openapiv3::ParameterSchemaOrContent::Content(_) => SchemaNode::Any,
+    };
+    Some(RequestParam {
+        location,
+        name: data.name.clone(),
+        required: data.required,
+        schema,
+    })
+}
+
+fn mark_recorded_collections(routes: &mut [RouteInfo]) {
+    let keys: Vec<String> = routes
+        .iter()
+        .map(|route| route.collection_key.clone())
+        .collect();
+    let mut seen = Vec::new();
+    for key in keys {
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key.clone());
+        let item_brace = format!("{key}/{{id}}");
+        let item_colon = format!("{key}/:id");
+        let has_list = routes.iter().any(|route| route.path == key);
+        let has_item = routes
+            .iter()
+            .any(|route| route.path == item_brace || route.path == item_colon);
+        let list_is_array = routes.iter().any(|route| {
+            route.path == key
+                && route.method == Method::GET
+                && matches!(route.response_schema, SchemaNode::Array { .. })
+        });
+        if !(has_list && has_item && list_is_array) {
+            continue;
+        }
+        let id_kind = routes
+            .iter()
+            .find(|route| route.path == item_brace || route.path == item_colon)
+            .and_then(|route| {
+                route.params.iter().find(|param| {
+                    param.location == ParamIn::Path && param.name == "id"
+                })
+            })
+            .map(|param| match &param.schema {
+                SchemaNode::Integer { .. } | SchemaNode::Number => IdKind::Integer,
+                _ => IdKind::String,
+            })
+            .unwrap_or(IdKind::String);
+
+        for route in routes.iter_mut() {
+            let list_write = route.path == key
+                && (route.method == Method::GET || route.method == Method::POST);
+            let item_write = (route.path == item_brace || route.path == item_colon)
+                && matches!(
+                    route.method,
+                    Method::GET | Method::PUT | Method::PATCH | Method::DELETE
+                );
+            if list_write || item_write {
+                route.recorded = true;
+                route.id_kind = id_kind;
+            }
+        }
+    }
 }
 
 fn extract_success_schema(operation: &openapiv3::Operation, api: &OpenAPI) -> (u16, SchemaNode) {
@@ -192,6 +434,7 @@ fn convert_schema(schema: &Schema, api: &OpenAPI, depth: usize) -> SchemaNode {
                 SchemaNode::Object {
                     properties,
                     required: obj.required.clone(),
+                    additional_properties: additional_properties_allowed(&obj.additional_properties),
                 }
             }
         },
@@ -205,6 +448,7 @@ fn convert_schema(schema: &Schema, api: &OpenAPI, depth: usize) -> SchemaNode {
                     if let SchemaNode::Object {
                         properties: p,
                         required: r,
+                        ..
                     } = resolve_schema(part, api, depth + 1)
                     {
                         for (k, v) in p {
@@ -217,6 +461,7 @@ fn convert_schema(schema: &Schema, api: &OpenAPI, depth: usize) -> SchemaNode {
                     return SchemaNode::Object {
                         properties,
                         required,
+                        additional_properties: true,
                     };
                 }
             }
@@ -306,6 +551,11 @@ fn json_value_to_schema(val: &Value) -> SchemaNode {
                     SchemaNode::Object {
                         properties,
                         required,
+                        additional_properties: obj
+                            .get("additionalProperties")
+                            .and_then(|v| v.as_bool())
+                            .map(|allowed| allowed)
+                            .unwrap_or(true),
                     }
                 }
                 _ => SchemaNode::Any,

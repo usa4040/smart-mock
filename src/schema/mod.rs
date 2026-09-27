@@ -1,112 +1,68 @@
 use crate::error::{AppError, Result};
-use crate::schema::types::RouteInfo;
+use crate::schema::types::{RouteInfo, RESET_PATH};
 use std::path::Path;
 
-pub mod json_def;
 pub mod openapi;
-pub mod typescript;
 pub mod types;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SchemaKind {
-    OpenApi,
-    JsonDef,
-    TypeScript,
-}
+pub use types::RESET_PATH as RESET_ROUTE;
 
-/// Detect schema kind from file extension and/or content.
-pub fn detect_kind(path: &Path, content: &str) -> Result<SchemaKind> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-
-    match ext.as_str() {
-        "ts" | "tsx" => return Ok(SchemaKind::TypeScript),
-        "yaml" | "yml" => return Ok(SchemaKind::OpenApi),
-        "json" => {
-            let trimmed = content.trim_start();
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
-                if v.get("routes").is_some() {
-                    return Ok(SchemaKind::JsonDef);
-                }
-                if v.get("openapi").is_some() || v.get("paths").is_some() {
-                    return Ok(SchemaKind::OpenApi);
-                }
-            }
-            return Err(AppError::UnsupportedFormat(
-                "JSON file must be OpenAPI (openapi/paths) or a routes definition".into(),
-            ));
-        }
-        _ => {}
-    }
-
-    // Fallback: sniff content
-    let trimmed = content.trim_start();
-    if trimmed.contains("interface ") || trimmed.contains("type ") && trimmed.contains('{') {
-        return Ok(SchemaKind::TypeScript);
-    }
-    if trimmed.starts_with('{') {
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            if v.get("routes").is_some() {
-                return Ok(SchemaKind::JsonDef);
-            }
-            if v.get("openapi").is_some() || v.get("paths").is_some() {
-                return Ok(SchemaKind::OpenApi);
-            }
-        }
-    }
-    if trimmed.contains("openapi:") || trimmed.contains("paths:") {
-        return Ok(SchemaKind::OpenApi);
-    }
-
-    Err(AppError::UnsupportedFormat(format!(
-        "cannot detect schema kind for {}",
-        path.display()
-    )))
-}
-
-/// Load and parse a schema file into route definitions.
+/// Load an OpenAPI document from disk.
 pub fn load_routes(path: &Path) -> Result<Vec<RouteInfo>> {
     let content = std::fs::read_to_string(path)?;
-    let kind = detect_kind(path, &content)?;
-    match kind {
-        SchemaKind::OpenApi => openapi::parse(&content),
-        SchemaKind::JsonDef => json_def::parse(&content),
-        SchemaKind::TypeScript => typescript::parse(&content),
+    parse_openapi(&content)
+}
+
+/// Parse an OpenAPI v3 document. Other schema kinds are outside the product.
+pub fn parse_openapi(content: &str) -> Result<Vec<RouteInfo>> {
+    if !looks_like_openapi(content) {
+        return Err(AppError::UnsupportedFormat(
+            "smart-mock reads an OpenAPI document".into(),
+        ));
     }
+    let routes = openapi::parse(content)?;
+    if routes.iter().any(|route| route.path == RESET_PATH) {
+        return Err(AppError::Validation(format!(
+            "contract path {RESET_PATH} is reserved for resetting the sandbox"
+        )));
+    }
+    Ok(routes)
+}
+
+fn looks_like_openapi(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    if trimmed.starts_with('{') {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            return false;
+        };
+        return value.get("openapi").is_some() || value.get("paths").is_some();
+    }
+    trimmed.contains("openapi:") || trimmed.contains("paths:")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     #[test]
-    fn detect_json_def() {
-        let content = r#"{"routes":[]}"#;
-        assert_eq!(
-            detect_kind(Path::new("schema.json"), content).unwrap(),
-            SchemaKind::JsonDef
-        );
+    fn rejects_json_route_definition() {
+        let error = parse_openapi(r#"{"routes":[]}"#).unwrap_err();
+        assert!(matches!(error, AppError::UnsupportedFormat(_)));
     }
 
     #[test]
-    fn detect_openapi_json() {
-        let content = r#"{"openapi":"3.0.0","paths":{}}"#;
-        assert_eq!(
-            detect_kind(Path::new("api.json"), content).unwrap(),
-            SchemaKind::OpenApi
-        );
-    }
-
-    #[test]
-    fn detect_ts() {
-        assert_eq!(
-            detect_kind(Path::new("users.ts"), "export interface User {}").unwrap(),
-            SchemaKind::TypeScript
-        );
-        let _ = PathBuf::new();
+    fn rejects_reset_collision() {
+        let spec = r#"
+openapi: "3.0.3"
+info: { title: t, version: "1" }
+paths:
+  /__smart_mock/reset:
+    post:
+      responses:
+        "204":
+          description: no content
+"#;
+        let error = parse_openapi(spec).unwrap_err();
+        assert!(matches!(error, AppError::Validation(_)));
     }
 }
